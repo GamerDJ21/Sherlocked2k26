@@ -1,0 +1,50 @@
+import {readFileSync,readdirSync} from 'node:fs';
+import {DatabaseSync} from 'node:sqlite';
+import ts from 'typescript';
+import assert from 'node:assert/strict';
+const sql=new DatabaseSync(':memory:');
+for(const f of readdirSync(new URL('../drizzle/',import.meta.url)).filter(f=>f.endsWith('.sql')).sort())sql.exec(readFileSync(new URL('../drizzle/'+f,import.meta.url),'utf8'));
+let clock=Date.now();Date.now=()=>clock;
+function statement(query,values=[]){return {bind(...v){return statement(query,v)},async first(){return sql.prepare(query).get(...values)||null},async all(){return {results:sql.prepare(query).all(...values)}},async run(){return sql.prepare(query).run(...values)}}}
+globalThis.testEnv={DB:{prepare:statement,async batch(stmts){sql.exec('BEGIN');try{const r=[];for(const s of stmts)r.push(await s.run());sql.exec('COMMIT');return r}catch(e){sql.exec('ROLLBACK');throw e}}},ADMIN_EMAILS:'admin@example.test'};
+globalThis.testUser={userId:'admin',email:'admin@example.test',displayName:'Admin'};
+const source=readFileSync(new URL('../server/game.ts',import.meta.url),'utf8');
+const js=ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2022}}).outputText;
+const {createGameHandlers}=await import('data:text/javascript;base64,'+Buffer.from(js).toString('base64'));
+const {GET,POST}=createGameHandlers(globalThis.testEnv,async()=>globalThis.testUser);
+async function post(b,origin='https://test.local',reset=true){if(reset)sql.exec('DELETE FROM throttles');return POST(new Request('https://test.local/api/game',{method:'POST',headers:{origin,'Content-Type':'application/json'},body:JSON.stringify(b)}))}
+const question={action:'saveQuestion',id:'case1',title:'Cipher',prompt:'Decode',format:'text',options:'',answer:'Baker Street',points:100,published:true,opens:Date.now()-1000,closes:Date.now()+600000};
+assert.equal((await post(question)).status,200);
+let data=await (await GET()).json();assert.equal(data.questions[0].answer,undefined);
+globalThis.testUser={userId:'p1',email:'p1@example.test',displayName:'Detective'};
+assert.equal((await post(question)).status,403);
+assert.equal((await post({action:'createTeam',name:'The Irregulars'})).status,410);
+assert.equal((await post({action:'joinTeam',code:'anything'})).status,410);
+// Opening a question must not throttle an immediately following answer.
+data=await (await GET()).json();assert.equal(data.questions[0].prompt,undefined);assert.equal(data.questions[0].options,undefined);
+assert.equal((await post({action:'answer',question:'case1',answer:'baker street'})).status,409);
+const opened=await (await post({action:'openQuestion',question:'case1'})).json();assert.equal(opened.question.prompt,'Decode');assert.equal(opened.question.answer,undefined);
+const initialStart=opened.question.startedAt;clock+=125432;
+const reopened=await (await post({action:'openQuestion',question:'case1'})).json();assert.equal(reopened.question.startedAt,initialStart);
+assert.equal((await post({action:'answer',question:'case1',answer:' BAKER   STREET '},'https://test.local',false)).status,200);
+data=await (await GET()).json();assert.equal(data.leaderboard[0].score,100);assert.equal(data.logs.length,0);assert.equal(data.timings[0].duration,125432);assert.equal(data.leaderboard[0].totalTime,125432);
+clock+=6000;sql.exec('UPDATE attempts SET at=0');await post({action:'answer',question:'case1',answer:'baker street'});data=await (await GET()).json();assert.equal(data.leaderboard[0].score,100);assert.equal(data.timings[0].duration,125432);
+assert.equal((await post({action:'event',kind:'raw_keystroke'})).status,400);
+assert.equal((await post({action:'event',kind:'heartbeat'})).status,200);
+assert.equal((await post({action:'event',kind:'heartbeat'},'https://evil.test')).status,403);
+// A second person receives a separate score without team enrollment.
+globalThis.testUser={userId:'p2',email:'p2@example.test',displayName:'Detective'};
+data=await (await GET()).json();assert.equal(data.participant.id,'solo:p2');assert.equal(data.solved.length,0);
+assert.equal(data.leaderboard.find(p=>p.id==='solo:p2').score,0);await post({action:'openQuestion',question:'case1'});clock+=40000;
+assert.equal((await post({action:'answer',question:'case1',answer:'baker street'})).status,200);
+data=await (await GET()).json();assert.equal(data.leaderboard.find(p=>p.id==='solo:p2').score,100);assert.equal(data.leaderboard.find(p=>p.id==='solo:p1').score,100);
+sql.exec('UPDATE questions SET closes=0');assert.equal((await post({action:'answer',question:'case1',answer:'baker street'})).status,409);
+globalThis.testUser={userId:'admin',email:'admin@example.test',displayName:'Admin'};assert.equal((await post(question)).status,409);
+assert.equal((await post({action:'removeQuestion',id:'case1'})).status,200);
+data=await (await GET()).json();assert.equal(data.questions.some(q=>q.id==='case1'),false);assert.equal(data.removedQuestions[0].id,'case1');
+globalThis.testUser={userId:'p1',email:'p1@example.test',displayName:'Detective'};
+data=await (await GET()).json();assert.equal(data.questions.length,0);assert.equal(data.removedQuestions.length,0);assert.equal(data.leaderboard.find(p=>p.id==='solo:p1').score,100);
+assert.equal((await post({action:'removeQuestion',id:'case1'})).status,403);assert.equal((await post({action:'restoreQuestion',id:'case1'})).status,403);assert.equal((await post({action:'openQuestion',question:'case1'})).status,409);assert.equal((await post({action:'answer',question:'case1',answer:'baker street'})).status,409);
+globalThis.testUser={userId:'admin',email:'admin@example.test',displayName:'Admin'};assert.equal((await post({action:'restoreQuestion',id:'case1'})).status,200);assert.equal(sql.prepare('SELECT published FROM questions WHERE id=?').get('case1').published,0);assert.equal(sql.prepare('SELECT COUNT(*) n FROM attempts').get().n>0,true);assert.equal(sql.prepare('SELECT COUNT(*) n FROM solves').get().n,2);
+globalThis.testUser=null;assert.equal((await GET()).status,401);assert.equal((await post(question)).status,401);
+console.log('PASS: authorized removal, draft restore, removed-question denial, preserved scores/logs, server start before reveal, immutable start, frozen duration, per-level times,  authentication, role checks, hidden answer, automatic solo enrollment, immediate submit after open, independent scores, normalization, duplicate scoring, deadlines, event allowlist, cross-origin rejection, locked questions.');

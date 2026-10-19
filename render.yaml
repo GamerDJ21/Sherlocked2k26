@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: sherlocked-2k26
+    runtime: node
+    plan: starter
+    buildCommand: npm ci --include=dev && npm run build:render
+    preDeployCommand: npm run db:render
+    startCommand: npm run start:render
+    healthCheckPath: /api/auth/config
+    envVars:
+      - key: NODE_VERSION
+        value: 24
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: sherlocked-db
+          property: connectionString
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: ADMIN_EMAILS
+        sync: false
+      - key: ALLOWED_EMAILS
+        sync: false
+      - key: APP_ORIGIN
+        sync: false
+
+databases:
+  - name: sherlocked-db
+    plan: basic-256mb
+    databaseName: sherlocked
+    user: sherlocked
+    ipAllowList: []
